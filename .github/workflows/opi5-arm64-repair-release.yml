@@ -1,0 +1,195 @@
+name: Orange Pi 5 ARM64 corrected AppImage
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  repair-release:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      UPSTREAM_COMMIT: b0f7c5c1624d133d7c9e519d3b6f5ebb04b80c58
+      UPSTREAM_ASSET_ID: '536592240'
+      UPSTREAM_APPIMAGE_SHA256: 8657b64c9e7e9a5d0994df01f510edee21b5fa0b835818971e22bd2bf579c542
+      DEPS_VERSION: release-20260805
+      DEPS_SHA256: bf24f7416d95bc434789f1e9aec043fb336aa95430ab9c256fa9341d8ff8622f
+      APPIMAGETOOL_SHA256: a6d71e2b6cd66f8e8d16c37ad164658985e0cf5fcaa950c90a482890cb9d13e0
+      RELEASE_TAG: opi5-arm64-preview
+      ASSET_NAME: DuckStation-arm64-Armbian-OrangePi5.AppImage
+
+    steps:
+      - name: Checkout attribution and license
+        uses: actions/checkout@v7
+
+      - name: Install packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl squashfs-tools patchelf binutils file xz-utils
+
+      - name: Download pinned upstream inputs
+        env:
+          API_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          curl -fL \
+            -H 'Accept: application/octet-stream' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            -H "Authorization: Bearer ${API_TOKEN}" \
+            "https://api.github.com/repos/stenzek/duckstation/releases/assets/${UPSTREAM_ASSET_ID}" \
+            -o DuckStation-upstream-arm64.AppImage
+
+          curl -fL \
+            "https://github.com/duckstation/dependencies/releases/download/${DEPS_VERSION}/deps-linux-cross-arm64.tar.xz" \
+            -o deps-linux-cross-arm64.tar.xz
+
+          curl -fL \
+            'https://github.com/duckstation/dependencies/releases/download/appimage-tools/appimagetool-x86_64.AppImage' \
+            -o appimagetool-x86_64.AppImage
+
+          echo "${UPSTREAM_APPIMAGE_SHA256}  DuckStation-upstream-arm64.AppImage" | sha256sum -c -
+          echo "${DEPS_SHA256}  deps-linux-cross-arm64.tar.xz" | sha256sum -c -
+          echo "${APPIMAGETOOL_SHA256}  appimagetool-x86_64.AppImage" | sha256sum -c -
+
+      - name: Extract official ARM64 AppImage
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          OFFSET=''
+          while IFS=: read -r candidate _; do
+            if unsquashfs -s -o "$candidate" DuckStation-upstream-arm64.AppImage >/dev/null 2>&1; then
+              OFFSET="$candidate"
+              break
+            fi
+          done < <(grep -aob 'hsqs' DuckStation-upstream-arm64.AppImage)
+
+          if [ -z "$OFFSET" ]; then
+            echo 'Could not locate a valid SquashFS payload in the upstream AppImage.' >&2
+            exit 1
+          fi
+
+          echo "SquashFS offset: $OFFSET"
+          head -c "$OFFSET" DuckStation-upstream-arm64.AppImage > runtime-aarch64
+          unsquashfs -o "$OFFSET" -d DuckStation.AppDir DuckStation-upstream-arm64.AppImage
+
+          file DuckStation.AppDir/usr/bin/duckstation-qt
+          readelf -h DuckStation.AppDir/usr/bin/duckstation-qt | grep -q 'AArch64'
+
+      - name: Inject missing bundled runtime libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p deps
+          tar -xJf deps-linux-cross-arm64.tar.xz -C deps
+
+          for lib in libshaderc_shared.so libspirv-cross-c-shared.so.0 libsqlite3.so.3; do
+            src="$(find deps -name "$lib" -print -quit)"
+            if [ -z "$src" ]; then
+              echo "Missing required upstream dependency: $lib" >&2
+              exit 1
+            fi
+
+            echo "Installing $lib from $src"
+            cp -L "$src" "DuckStation.AppDir/usr/bin/$lib"
+            chmod 0755 "DuckStation.AppDir/usr/bin/$lib"
+            patchelf --set-rpath '$ORIGIN:$ORIGIN/../lib' "DuckStation.AppDir/usr/bin/$lib"
+          done
+
+      - name: Validate repaired AppDir
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for lib in libshaderc_shared.so libspirv-cross-c-shared.so.0 libsqlite3.so.3; do
+            test -s "DuckStation.AppDir/usr/bin/$lib"
+            file "DuckStation.AppDir/usr/bin/$lib" | grep -q 'ARM aarch64'
+          done
+
+          test -x DuckStation.AppDir/usr/bin/duckstation-qt
+          test -L DuckStation.AppDir/AppRun
+          test "$(readlink DuckStation.AppDir/AppRun)" = 'usr/bin/duckstation-qt'
+
+          echo 'Bundled runtime libraries now present beside duckstation-qt:'
+          ls -lh \
+            DuckStation.AppDir/usr/bin/libshaderc_shared.so \
+            DuckStation.AppDir/usr/bin/libspirv-cross-c-shared.so.0 \
+            DuckStation.AppDir/usr/bin/libsqlite3.so.3
+
+      - name: Repack corrected ARM64 AppImage
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          chmod +x appimagetool-x86_64.AppImage
+          rm -rf appimagetool-root squashfs-root
+          ./appimagetool-x86_64.AppImage --appimage-extract >/dev/null
+          mv squashfs-root appimagetool-root
+
+          appimagetool-root/AppRun -v \
+            --runtime-file runtime-aarch64 \
+            DuckStation.AppDir \
+            "$ASSET_NAME"
+
+          chmod +x "$ASSET_NAME"
+          sha256sum "$ASSET_NAME" > "$ASSET_NAME.sha256"
+
+      - name: Write release metadata
+        shell: bash
+        run: |
+          cat > BUILDINFO.txt <<EOF
+          DuckStation ARM64 compatibility repack for Armbian / Orange Pi 5
+
+          Upstream repository: https://github.com/stenzek/duckstation
+          Upstream source commit: ${UPSTREAM_COMMIT}
+          Upstream ARM64 asset ID: ${UPSTREAM_ASSET_ID}
+          Upstream ARM64 SHA-256: ${UPSTREAM_APPIMAGE_SHA256}
+          Dependency release: ${DEPS_VERSION}
+          Dependency archive SHA-256: ${DEPS_SHA256}
+
+          Packaging-only repair:
+          - libshaderc_shared.so is placed beside usr/bin/duckstation-qt
+          - libspirv-cross-c-shared.so.0 is placed beside usr/bin/duckstation-qt
+          - libsqlite3.so.3 is placed beside usr/bin/duckstation-qt
+
+          DuckStation's DynamicLibrary::GetBundledLibraryPath() resolves these
+          dynamically loaded libraries from the executable directory on Linux.
+          No DuckStation emulation or rendering source code is modified.
+          EOF
+
+          cp LICENSE DuckStation-LICENSE.txt
+
+          cat > RELEASE_NOTES.md <<EOF
+          Unofficial ARM64 compatibility repack for Armbian on Orange Pi 5-class RK3588 boards.
+
+          This release starts from DuckStation's official ARM64 AppImage at upstream commit ${UPSTREAM_COMMIT}. It does not modify DuckStation emulation or rendering code. It repairs the ARM64 AppImage packaging by placing the three dynamically loaded bundled libraries that current DuckStation resolves beside duckstation-qt: libshaderc_shared.so, libspirv-cross-c-shared.so.0, and libsqlite3.so.3.
+
+          The upstream AppImage and dependency archive are SHA-256 pinned in the workflow. BUILDINFO.txt records the exact inputs.
+
+          This is an unofficial compatibility build and is not endorsed by the DuckStation project. DuckStation remains subject to its upstream license; the license text is attached to this release.
+          EOF
+
+      - name: Publish rolling compatibility release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gh release delete "$RELEASE_TAG" --cleanup-tag -y >/dev/null 2>&1 || true
+          gh release create "$RELEASE_TAG" \
+            "$ASSET_NAME" \
+            "$ASSET_NAME.sha256" \
+            BUILDINFO.txt \
+            DuckStation-LICENSE.txt \
+            --target "$GITHUB_SHA" \
+            --title 'DuckStation ARM64 - Armbian / Orange Pi 5 compatibility repack' \
+            --notes-file RELEASE_NOTES.md \
+            --prerelease
